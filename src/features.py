@@ -41,8 +41,9 @@ STAT_COLS = [
     "ko_finish_rate",   # derived below
 ]
 
-# Stats that get exponentially-weighted counterparts (decay_rate = 0.13/year)
-EW_STAT_COLS = STAT_COLS
+# Stats that get exponentially-weighted counterparts (decay_rate = 0.13/year).
+# Must NOT include cluster-style features (those live in STAT_COLS only).
+EW_STAT_COLS = list(STAT_COLS) + ["knockdown_rate", "ctrl_rate"]
 
 # Ordinal encoding ordered by weight limit. Each class gets a unique integer so
 # XGBoost can learn division-specific patterns (KO rates, grappling dominance, etc.)
@@ -76,6 +77,17 @@ _MU_SCALE           = 173.7178  # converts between Glicko-2 internal μ and Elo-
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _total_fights(df: pd.DataFrame, corner: str) -> pd.Series:
+    w = pd.to_numeric(df[f"{corner}_wins"],   errors="coerce").fillna(0)
+    l = pd.to_numeric(df[f"{corner}_losses"], errors="coerce").fillna(0)
+    d = pd.to_numeric(df[f"{corner}_draw"],   errors="coerce").fillna(0)
+    return w + l + d
+
+
+# ---------------------------------------------------------------------------
 # Derived columns
 # ---------------------------------------------------------------------------
 
@@ -86,6 +98,27 @@ def add_ko_finish_rate(df: pd.DataFrame) -> pd.DataFrame:
         ko   = pd.to_numeric(df[f"{corner}_win_by_KO/TKO"], errors="coerce").fillna(0)
         wins = pd.to_numeric(df[f"{corner}_wins"],          errors="coerce").fillna(0).clip(lower=1)
         df[f"{corner}_ko_finish_rate"] = (ko / wins).clip(0, 1)
+    return df
+
+
+def add_kd_ctrl_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive knockdown and grappling-control proxy features from cumulative win-method counts.
+
+    knockdown_rate: KO/TKO wins ÷ total fights  (per-fight KO danger, not just per-win)
+    ctrl_rate:      submission wins ÷ wins       (fraction of wins by submission — grappling quality)
+
+    Both use data that's available for every fighter in the base dataset.
+    When the scraper adds real avg_KD / avg_ctrl_secs columns, those can be used alongside.
+    """
+    df = df.copy()
+    for corner in ("R", "B"):
+        ko  = pd.to_numeric(df[f"{corner}_win_by_KO/TKO"],    errors="coerce").fillna(0)
+        sub = pd.to_numeric(df[f"{corner}_win_by_Submission"], errors="coerce").fillna(0)
+        wins  = pd.to_numeric(df[f"{corner}_wins"],   errors="coerce").fillna(0).clip(lower=1)
+        total = _total_fights(df, corner).clip(lower=1)
+        df[f"{corner}_knockdown_rate"] = (ko  / total).clip(0, 1)
+        df[f"{corner}_ctrl_rate"]      = (sub / wins ).clip(0, 1)
     return df
 
 
@@ -319,13 +352,6 @@ def add_glicko_ratings(df: pd.DataFrame) -> pd.DataFrame:
 # Feature matrix assembly
 # ---------------------------------------------------------------------------
 
-def _total_fights(df: pd.DataFrame, corner: str) -> pd.Series:
-    w = pd.to_numeric(df[f"{corner}_wins"],   errors="coerce").fillna(0)
-    l = pd.to_numeric(df[f"{corner}_losses"], errors="coerce").fillna(0)
-    d = pd.to_numeric(df[f"{corner}_draw"],   errors="coerce").fillna(0)
-    return w + l + d
-
-
 def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build the doubled feature matrix: for every fight, create two rows —
@@ -369,6 +395,14 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
             a_vals = pd.to_numeric(df[r_col], errors="coerce").fillna(0)
             b_vals = pd.to_numeric(df[b_col], errors="coerce").fillna(0)
             rows[f"{stat}_delta"] = (sign * (a_vals - b_vals)).values
+
+        # Knockdown & control-time proxy deltas (columns added by add_kd_ctrl_features)
+        for stat, fill in [("knockdown_rate", 0.0), ("ctrl_rate", 0.0)]:
+            r_v = pd.to_numeric(df.get(f"R_{stat}", pd.Series(fill, index=df.index)),
+                                errors="coerce").fillna(fill)
+            b_v = pd.to_numeric(df.get(f"B_{stat}", pd.Series(fill, index=df.index)),
+                                errors="coerce").fillna(fill)
+            rows[f"{stat}_delta"] = (sign * (r_v - b_v)).values
 
         # Physical / meta deltas
         rows["reach_delta"] = (sign * (
@@ -790,6 +824,9 @@ def main(csv_path: str) -> None:
 
     print("Deriving ko_finish_rate...")
     df = add_ko_finish_rate(df)
+
+    print("Deriving knockdown rate and grappling control rate...")
+    df = add_kd_ctrl_features(df)
 
     print("Computing days since last fight...")
     df = add_days_since_last_fight(df)

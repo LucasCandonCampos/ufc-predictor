@@ -67,6 +67,10 @@ FEATURE_LABELS: dict[str, str] = {
     "ew_avg_TD_landed_delta":      "EW grappling output",
     "ew_avg_SUB_ATT_delta":        "EW submission attempts",
     "ew_ko_finish_rate_delta":     "EW KO/TKO finish rate",
+    "knockdown_rate_delta":        "KO/TKO rate per fight",
+    "ctrl_rate_delta":             "Submission win rate",
+    "ew_knockdown_rate_delta":     "EW KO/TKO rate per fight",
+    "ew_ctrl_rate_delta":          "EW submission win rate",
 }
 
 
@@ -207,6 +211,7 @@ def lookup_fighter(
     c = latest["_corner"]
 
     ko   = _fval(latest.get(f"{c}_win_by_KO/TKO"))
+    sub  = _fval(latest.get(f"{c}_win_by_Submission"))
     wins = _fval(latest.get(f"{c}_wins"))
     w    = _fval(latest.get(f"{c}_losses"))
     d    = _fval(latest.get(f"{c}_draw"))
@@ -247,6 +252,8 @@ def lookup_fighter(
         "avg_TD_landed":      td_landed,
         "avg_SUB_ATT":        _fval(latest.get(f"{c}_avg_SUB_ATT")),
         "ko_finish_rate":     ko / max(wins, 1),
+        "knockdown_rate":     ko  / max(wins + w + d, 1),
+        "ctrl_rate":          sub / max(wins, 1),
         "reach_cms":          _fval(latest.get(f"{c}_Reach_cms")),
         "age":                _fval(latest.get(f"{c}_age")),
         "total_fights":       wins + w + d,
@@ -300,6 +307,8 @@ def build_feature_vector(
     wc_ord = WEIGHT_CLASS_ORD.get(wc, 6)
 
     row: dict = {
+        "knockdown_rate_delta":     stats_a["knockdown_rate"]       - stats_b["knockdown_rate"],
+        "ctrl_rate_delta":          stats_a["ctrl_rate"]            - stats_b["ctrl_rate"],
         "avg_SIG_STR_pct_delta":    stats_a["avg_SIG_STR_pct"]     - stats_b["avg_SIG_STR_pct"],
         "avg_SIG_STR_landed_delta": stats_a["avg_SIG_STR_landed"]   - stats_b["avg_SIG_STR_landed"],
         "avg_TD_pct_delta":         stats_a["avg_TD_pct"]           - stats_b["avg_TD_pct"],

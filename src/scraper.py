@@ -63,6 +63,12 @@ def _parse_time_str(s: str) -> float:
     return (int(m.group(1)) + int(m.group(2)) / 60.0) if m else 0.0
 
 
+def _parse_ctrl_secs(s: str) -> int:
+    """'4:13' → 253 seconds; '--' or '' → 0."""
+    m = re.match(r"(\d+):(\d+)", s.strip())
+    return int(m.group(1)) * 60 + int(m.group(2)) if m else 0
+
+
 def _split_cell(cell) -> tuple[str, str]:
     """Split a two-fighter cell on '|' → (val_fighter_0, val_fighter_1)."""
     parts = [p.strip() for p in cell.get_text(separator="|", strip=True).split("|") if p.strip()]
@@ -234,7 +240,8 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
 
     agg = {"sig_str_landed": [0, 0], "sig_str_att": [0, 0],
            "td_landed":      [0, 0], "td_att":      [0, 0],
-           "sub_att":        [0, 0], "kd":          [0, 0]}
+           "sub_att":        [0, 0], "kd":          [0, 0],
+           "ctrl_secs":      [0, 0]}
 
     for row in tables[0].select("tr"):
         cells = row.select("td")
@@ -260,6 +267,11 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
         agg["sub_att"][0] += int(u0) if u0.isdigit() else 0
         agg["sub_att"][1] += int(u1) if u1.isdigit() else 0
 
+        if len(cells) > 9:
+            c0, c1 = _split_cell(cells[9])
+            agg["ctrl_secs"][0] += _parse_ctrl_secs(c0)
+            agg["ctrl_secs"][1] += _parse_ctrl_secs(c1)
+
     def _stats(idx: int) -> dict:
         sl = agg["sig_str_landed"][idx];  sa = agg["sig_str_att"][idx]
         tl = agg["td_landed"][idx];       ta = agg["td_att"][idx]
@@ -272,6 +284,7 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
             "td_pct":         tl / ta if ta > 0 else 0.0,
             "sub_att":        agg["sub_att"][idx],
             "kd":             agg["kd"][idx],
+            "ctrl_secs":      agg["ctrl_secs"][idx],
         }
 
     return {
@@ -366,11 +379,13 @@ def update_career_stats(
 
     # Update averages
     fs = fight_stats
-    new_sig_landed = upd_per15(g("avg_SIG_STR_landed"), fs["sig_str_landed"])
-    new_sig_pct    = upd_pct(  g("avg_SIG_STR_pct"),   fs["sig_str_pct"])
-    new_td_landed  = upd_per15(g("avg_TD_landed"),      fs["td_landed"])
-    new_td_pct     = upd_pct(  g("avg_TD_pct"),         fs["td_pct"])
-    new_sub_att    = upd_per15(g("avg_SUB_ATT"),         fs["sub_att"])
+    new_sig_landed  = upd_per15(g("avg_SIG_STR_landed"), fs["sig_str_landed"])
+    new_sig_pct     = upd_pct(  g("avg_SIG_STR_pct"),   fs["sig_str_pct"])
+    new_td_landed   = upd_per15(g("avg_TD_landed"),      fs["td_landed"])
+    new_td_pct      = upd_pct(  g("avg_TD_pct"),         fs["td_pct"])
+    new_sub_att     = upd_per15(g("avg_SUB_ATT"),        fs["sub_att"])
+    new_avg_kd      = upd_per15(g("avg_KD",      0.0),   fs["kd"])
+    new_avg_ctrl    = upd_per15(g("avg_ctrl_secs", 0.0), fs["ctrl_secs"])
 
     # Win/loss/draw counts
     if is_draw:
@@ -425,6 +440,8 @@ def update_career_stats(
         f"{p}avg_TD_pct":               round(new_td_pct, 4),
         f"{p}avg_TD_landed":            round(new_td_landed, 4),
         f"{p}avg_SUB_ATT":              round(new_sub_att, 4),
+        f"{p}avg_KD":                   round(new_avg_kd, 4),
+        f"{p}avg_ctrl_secs":            round(new_avg_ctrl, 1),
         f"{p}total_rounds_fought":      new_total_rounds,
         f"{p}current_win_streak":       win_streak,
         f"{p}current_lose_streak":      lose_streak,
