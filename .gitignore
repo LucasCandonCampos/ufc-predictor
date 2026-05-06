@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+.AppleDouble
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Secrets — never commit these
+*.env
+secrets.txt
+
+# Large generated intermediate file (re-run features.py to regenerate)
+data/matchup_features.csv
+
+# Logs
+*.log
+/tmp/
