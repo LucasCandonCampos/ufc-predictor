@@ -71,6 +71,12 @@ FEATURE_LABELS: dict[str, str] = {
     "ctrl_rate_delta":             "Submission win rate",
     "ew_knockdown_rate_delta":     "EW KO/TKO rate per fight",
     "ew_ctrl_rate_delta":          "EW submission win rate",
+    "a_age":                       "Fighter A age",
+    "b_age":                       "Fighter B age",
+    "decision_rate_delta":         "Decision win rate",
+    "finish_loss_rate_delta":      "Finish vulnerability",
+    "punch_finish_rate_delta":     "Punch/elbow KO rate",
+    "kick_finish_rate_delta":      "Kick/knee KO rate",
 }
 
 
@@ -178,6 +184,49 @@ def _recent_form(all_rows: pd.DataFrame) -> dict:
             "curr_lose_streak": lose_streak}
 
 
+_PUNCH_DETAILS = {
+    "Punch", "Punches", "Elbow", "Elbows",
+    "Spinning Back Elbow", "Spinning Back Fist",
+    "Punch to Head At Distance", "Punch to Body At Distance",
+    "Punches to Head On Ground",
+    "Elbows to Head From Half Guard", "Elbows to Body From Half Guard",
+}
+_KICK_DETAILS = {
+    "Kick", "Kicks", "Knee", "Knees", "Flying Knee",
+    "Kick to Head At Distance",
+    "Knee to Body In Clinch", "Knee to Head At Distance",
+    "Spinning Back Kick",
+}
+
+
+def _method_stats(all_rows: pd.DataFrame) -> dict:
+    """Compute win/loss method distribution from a fighter's sorted fight history."""
+    fl = lc = pk = kk = ko = 0
+    for _, row in all_rows.iterrows():
+        corner  = str(row["_corner"])
+        winner  = str(row.get("Winner", "")).strip()
+        finish  = str(row.get("finish", "")).upper()
+        details = str(row.get("finish_details", ""))
+        won  = (winner in ("R", "Red")  and corner == "R") or \
+               (winner in ("B", "Blue") and corner == "B")
+        lost = (winner in ("R", "Red")  and corner == "B") or \
+               (winner in ("B", "Blue") and corner == "R")
+        is_ko  = finish == "KO/TKO"
+        is_sub = finish == "SUB"
+        if won and is_ko:
+            ko += 1
+            if details in _PUNCH_DETAILS: pk += 1
+            if details in _KICK_DETAILS:  kk += 1
+        if lost:
+            lc += 1
+            if is_ko or is_sub: fl += 1
+    return {
+        "finish_loss_rate":  fl / lc if lc > 0 else 0.0,
+        "punch_finish_rate": pk / ko if ko > 0 else 0.0,
+        "kick_finish_rate":  kk / ko if ko > 0 else 0.0,
+    }
+
+
 def lookup_fighter(
     name: str,
     df: pd.DataFrame,
@@ -218,6 +267,7 @@ def lookup_fighter(
 
     form       = _recent_form(all_rows)
     absorbed   = _absorbed_stats(all_rows)
+    method     = _method_stats(all_rows)
     str_landed = _fval(latest.get(f"{c}_avg_SIG_STR_landed"))
     td_landed  = _fval(latest.get(f"{c}_avg_TD_landed"))
     absorbed["str_net_rate"] = str_landed - absorbed["avg_absorbed_str"]
@@ -254,6 +304,9 @@ def lookup_fighter(
         "ko_finish_rate":     ko / max(wins, 1),
         "knockdown_rate":     ko  / max(wins + w + d, 1),
         "ctrl_rate":          sub / max(wins, 1),
+        "decision_rate":      (_fval(latest.get(f"{c}_win_by_Decision_Unanimous")) +
+                               _fval(latest.get(f"{c}_win_by_Decision_Split")) +
+                               _fval(latest.get(f"{c}_win_by_Decision_Majority"))) / max(wins, 1),
         "reach_cms":          _fval(latest.get(f"{c}_Reach_cms")),
         "age":                _fval(latest.get(f"{c}_age")),
         "total_fights":       wins + w + d,
@@ -261,6 +314,7 @@ def lookup_fighter(
         "glicko_rd":          glicko_rd,
         **form,
         **absorbed,
+        **method,
         **ew_stats,
     }
 
@@ -309,6 +363,12 @@ def build_feature_vector(
     row: dict = {
         "knockdown_rate_delta":     stats_a["knockdown_rate"]       - stats_b["knockdown_rate"],
         "ctrl_rate_delta":          stats_a["ctrl_rate"]            - stats_b["ctrl_rate"],
+        "decision_rate_delta":      stats_a["decision_rate"]        - stats_b["decision_rate"],
+        "finish_loss_rate_delta":   stats_a["finish_loss_rate"]     - stats_b["finish_loss_rate"],
+        "punch_finish_rate_delta":  stats_a["punch_finish_rate"]    - stats_b["punch_finish_rate"],
+        "kick_finish_rate_delta":   stats_a["kick_finish_rate"]     - stats_b["kick_finish_rate"],
+        "a_age":                    stats_a["age"],
+        "b_age":                    stats_b["age"],
         "avg_SIG_STR_pct_delta":    stats_a["avg_SIG_STR_pct"]     - stats_b["avg_SIG_STR_pct"],
         "avg_SIG_STR_landed_delta": stats_a["avg_SIG_STR_landed"]   - stats_b["avg_SIG_STR_landed"],
         "avg_TD_pct_delta":         stats_a["avg_TD_pct"]           - stats_b["avg_TD_pct"],

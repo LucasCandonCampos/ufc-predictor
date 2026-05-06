@@ -122,6 +122,104 @@ def add_kd_ctrl_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_method_distribution(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add win/loss method distribution features in strict date order.
+
+    Derived from cumulative win-method counts (no rolling needed):
+        {R,B}_decision_rate  — decision wins / wins (style indicator)
+
+    Computed in date order (rolling, no leakage):
+        {R,B}_finish_loss_rate  — losses stopped by KO or submission (vulnerability)
+        {R,B}_punch_finish_rate — KO wins via punches/elbows (head-strike targeting proxy)
+        {R,B}_kick_finish_rate  — KO wins via kicks/knees   (leg/body-strike targeting proxy)
+    """
+    PUNCH_DETAILS = {
+        "Punch", "Punches", "Elbow", "Elbows",
+        "Spinning Back Elbow", "Spinning Back Fist",
+        "Punch to Head At Distance", "Punch to Body At Distance",
+        "Punches to Head On Ground",
+        "Elbows to Head From Half Guard", "Elbows to Body From Half Guard",
+    }
+    KICK_DETAILS = {
+        "Kick", "Kicks", "Knee", "Knees", "Flying Knee",
+        "Kick to Head At Distance",
+        "Knee to Body In Clinch", "Knee to Head At Distance",
+        "Spinning Back Kick",
+    }
+
+    df = df.copy().sort_values("date").reset_index(drop=True)
+    n = len(df)
+
+    # State per fighter: [finish_loss_count, loss_count, punch_ko_count, kick_ko_count, ko_win_count]
+    state: dict = {}
+
+    arrays: dict[str, np.ndarray] = {
+        "R_finish_loss_rate":  np.zeros(n),
+        "B_finish_loss_rate":  np.zeros(n),
+        "R_punch_finish_rate": np.zeros(n),
+        "B_punch_finish_rate": np.zeros(n),
+        "R_kick_finish_rate":  np.zeros(n),
+        "B_kick_finish_rate":  np.zeros(n),
+    }
+
+    finish_s  = df["finish"].fillna("").astype(str).str.upper()
+    details_s = df["finish_details"].fillna("").astype(str)
+
+    for i in range(n):
+        row     = df.iloc[i]
+        r_name  = normalize_name(str(row["R_fighter"]))
+        b_name  = normalize_name(str(row["B_fighter"]))
+        winner  = str(row["Winner"]).strip()
+        finish  = finish_s.iloc[i]
+        details = details_s.iloc[i]
+
+        is_ko_finish  = finish == "KO/TKO"
+        is_sub_finish = finish == "SUB"
+        is_punch      = details in PUNCH_DETAILS
+        is_kick       = details in KICK_DETAILS
+
+        for corner, name in [("R", r_name), ("B", b_name)]:
+            if name not in state:
+                state[name] = [0, 0, 0, 0, 0]
+            fl, lc, pk, kk, ko = state[name]
+
+            # Record pre-fight stats (before update)
+            arrays[f"{corner}_finish_loss_rate"][i]  = fl / lc if lc > 0 else 0.0
+            arrays[f"{corner}_punch_finish_rate"][i] = pk / ko if ko > 0 else 0.0
+            arrays[f"{corner}_kick_finish_rate"][i]  = kk / ko if ko > 0 else 0.0
+
+            # Determine this fight's outcome for this corner
+            won  = (winner in ("R", "Red")  and corner == "R") or \
+                   (winner in ("B", "Blue") and corner == "B")
+            lost = (winner in ("R", "Red")  and corner == "B") or \
+                   (winner in ("B", "Blue") and corner == "R")
+
+            if won and is_ko_finish:
+                ko += 1
+                if is_punch: pk += 1
+                if is_kick:  kk += 1
+            if lost:
+                lc += 1
+                if is_ko_finish or is_sub_finish:
+                    fl += 1
+
+            state[name] = [fl, lc, pk, kk, ko]
+
+    for col, arr in arrays.items():
+        df[col] = arr
+
+    # Simple derived: decision rate — ratio of cumulative columns, no rolling needed
+    for corner in ("R", "B"):
+        dec_u = pd.to_numeric(df[f"{corner}_win_by_Decision_Unanimous"], errors="coerce").fillna(0)
+        dec_s = pd.to_numeric(df[f"{corner}_win_by_Decision_Split"],     errors="coerce").fillna(0)
+        dec_m = pd.to_numeric(df[f"{corner}_win_by_Decision_Majority"],  errors="coerce").fillna(0)
+        wins  = pd.to_numeric(df[f"{corner}_wins"], errors="coerce").fillna(0).clip(lower=1)
+        df[f"{corner}_decision_rate"] = ((dec_u + dec_s + dec_m) / wins).clip(0, 1)
+
+    return df
+
+
 def add_days_since_last_fight(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add {R,B}_days_since: days between this fight and the fighter's previous
@@ -410,10 +508,12 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
             pd.to_numeric(df["B_Reach_cms"], errors="coerce")
         )).fillna(0).values
 
-        rows["age_delta"] = (sign * (
-            pd.to_numeric(df["R_age"], errors="coerce") -
-            pd.to_numeric(df["B_age"], errors="coerce")
-        )).fillna(0).values
+        r_age = pd.to_numeric(df["R_age"], errors="coerce").fillna(0)
+        b_age = pd.to_numeric(df["B_age"], errors="coerce").fillna(0)
+        rows["age_delta"] = (sign * (r_age - b_age)).values
+        # Absolute age: captures non-linear prime/decline effects the delta alone cannot
+        rows["a_age"] = (r_age if is_r_perspective else b_age).values
+        rows["b_age"] = (b_age if is_r_perspective else r_age).values
 
         rows["experience_delta"] = (
             sign * (_total_fights(df, "R") - _total_fights(df, "B"))
@@ -468,6 +568,19 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
             b_v = pd.to_numeric(df.get(f"B_ew_{stat}", pd.Series(0.0, index=df.index)),
                                 errors="coerce").fillna(0.0)
             rows[f"ew_{stat}_delta"] = (sign * (r_v - b_v)).values
+
+        # Win/loss method distribution deltas (columns added by add_method_distribution)
+        for stat, fill in [
+            ("decision_rate",    0.0),
+            ("finish_loss_rate", 0.0),
+            ("punch_finish_rate",0.0),
+            ("kick_finish_rate", 0.0),
+        ]:
+            r_v = pd.to_numeric(df.get(f"R_{stat}", pd.Series(fill, index=df.index)),
+                                errors="coerce").fillna(fill)
+            b_v = pd.to_numeric(df.get(f"B_{stat}", pd.Series(fill, index=df.index)),
+                                errors="coerce").fillna(fill)
+            rows[f"{stat}_delta"] = (sign * (r_v - b_v)).values
 
         perspectives.append(pd.DataFrame(rows))
 
@@ -827,6 +940,9 @@ def main(csv_path: str) -> None:
 
     print("Deriving knockdown rate and grappling control rate...")
     df = add_kd_ctrl_features(df)
+
+    print("Computing win/loss method distribution...")
+    df = add_method_distribution(df)
 
     print("Computing days since last fight...")
     df = add_days_since_last_fight(df)

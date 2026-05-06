@@ -238,10 +238,11 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
     if not tables:
         return None
 
-    agg = {"sig_str_landed": [0, 0], "sig_str_att": [0, 0],
-           "td_landed":      [0, 0], "td_att":      [0, 0],
-           "sub_att":        [0, 0], "kd":          [0, 0],
-           "ctrl_secs":      [0, 0]}
+    agg = {"sig_str_landed": [0, 0], "sig_str_att":  [0, 0],
+           "td_landed":      [0, 0], "td_att":       [0, 0],
+           "sub_att":        [0, 0], "kd":           [0, 0],
+           "ctrl_secs":      [0, 0],
+           "head_landed":    [0, 0], "body_landed":  [0, 0], "leg_landed": [0, 0]}
 
     for row in tables[0].select("tr"):
         cells = row.select("td")
@@ -272,6 +273,20 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
             agg["ctrl_secs"][0] += _parse_ctrl_secs(c0)
             agg["ctrl_secs"][1] += _parse_ctrl_secs(c1)
 
+    # Table 1: Significant Strikes breakdown (head / body / leg)
+    # Columns: 0=names, 1=sig_str(x/y), 2=head(x/y), 3=body(x/y), 4=leg(x/y), ...
+    if len(tables) > 1:
+        for row in tables[1].select("tr"):
+            cells = row.select("td")
+            if not cells or len(cells) < 5:
+                continue
+            h0, h1 = _split_cell(cells[2]); hl0, _ = _x_of_y(h0); hl1, _ = _x_of_y(h1)
+            b0, b1 = _split_cell(cells[3]); bl0, _ = _x_of_y(b0); bl1, _ = _x_of_y(b1)
+            g0, g1 = _split_cell(cells[4]); gl0, _ = _x_of_y(g0); gl1, _ = _x_of_y(g1)
+            agg["head_landed"][0] += hl0;  agg["head_landed"][1] += hl1
+            agg["body_landed"][0] += bl0;  agg["body_landed"][1] += bl1
+            agg["leg_landed"][0]  += gl0;  agg["leg_landed"][1]  += gl1
+
     def _stats(idx: int) -> dict:
         sl = agg["sig_str_landed"][idx];  sa = agg["sig_str_att"][idx]
         tl = agg["td_landed"][idx];       ta = agg["td_att"][idx]
@@ -285,6 +300,9 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
             "sub_att":        agg["sub_att"][idx],
             "kd":             agg["kd"][idx],
             "ctrl_secs":      agg["ctrl_secs"][idx],
+            "head_landed":    agg["head_landed"][idx],
+            "body_landed":    agg["body_landed"][idx],
+            "leg_landed":     agg["leg_landed"][idx],
         }
 
     return {
@@ -384,8 +402,11 @@ def update_career_stats(
     new_td_landed   = upd_per15(g("avg_TD_landed"),      fs["td_landed"])
     new_td_pct      = upd_pct(  g("avg_TD_pct"),         fs["td_pct"])
     new_sub_att     = upd_per15(g("avg_SUB_ATT"),        fs["sub_att"])
-    new_avg_kd      = upd_per15(g("avg_KD",      0.0),   fs["kd"])
-    new_avg_ctrl    = upd_per15(g("avg_ctrl_secs", 0.0), fs["ctrl_secs"])
+    new_avg_kd      = upd_per15(g("avg_KD",          0.0), fs["kd"])
+    new_avg_ctrl    = upd_per15(g("avg_ctrl_secs",   0.0), fs["ctrl_secs"])
+    new_avg_head    = upd_per15(g("avg_head_landed", 0.0), fs["head_landed"])
+    new_avg_body    = upd_per15(g("avg_body_landed", 0.0), fs["body_landed"])
+    new_avg_leg     = upd_per15(g("avg_leg_landed",  0.0), fs["leg_landed"])
 
     # Win/loss/draw counts
     if is_draw:
@@ -442,6 +463,9 @@ def update_career_stats(
         f"{p}avg_SUB_ATT":              round(new_sub_att, 4),
         f"{p}avg_KD":                   round(new_avg_kd, 4),
         f"{p}avg_ctrl_secs":            round(new_avg_ctrl, 1),
+        f"{p}avg_head_landed":          round(new_avg_head, 4),
+        f"{p}avg_body_landed":          round(new_avg_body, 4),
+        f"{p}avg_leg_landed":           round(new_avg_leg, 4),
         f"{p}total_rounds_fought":      new_total_rounds,
         f"{p}current_win_streak":       win_streak,
         f"{p}current_lose_streak":      lose_streak,
