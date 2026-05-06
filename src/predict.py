@@ -19,7 +19,7 @@ import shap
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(__file__))
 from cluster import load_raw_data, normalize_name, load_models as load_cluster_models
-from features import WEIGHT_CLASS_ORD
+from features import WEIGHT_CLASS_ORD, EW_STAT_COLS
 from calibration import _CalibratedModel  # noqa: F401 — required for pickle to resolve the class
 
 ROOT       = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
@@ -61,6 +61,12 @@ FEATURE_LABELS: dict[str, str] = {
     "td_net_rate_delta":          "Net grappling rate",
     "glicko_rating_delta":        "Glicko-2 skill rating",
     "glicko_rd_delta":            "Rating uncertainty (RD)",
+    "ew_avg_SIG_STR_pct_delta":    "EW striking accuracy",
+    "ew_avg_SIG_STR_landed_delta": "EW striking volume",
+    "ew_avg_TD_pct_delta":         "EW takedown accuracy",
+    "ew_avg_TD_landed_delta":      "EW grappling output",
+    "ew_avg_SUB_ATT_delta":        "EW submission attempts",
+    "ew_ko_finish_rate_delta":     "EW KO/TKO finish rate",
 }
 
 
@@ -168,7 +174,12 @@ def _recent_form(all_rows: pd.DataFrame) -> dict:
             "curr_lose_streak": lose_streak}
 
 
-def lookup_fighter(name: str, df: pd.DataFrame, ratings_df: pd.DataFrame | None = None) -> dict:
+def lookup_fighter(
+    name: str,
+    df: pd.DataFrame,
+    ratings_df: pd.DataFrame | None = None,
+    ew_df: pd.DataFrame | None = None,
+) -> dict:
     """
     Find a fighter in the dataset by name (fuzzy matched) and return their
     most recent pre-fight career stats.
@@ -217,6 +228,15 @@ def lookup_fighter(name: str, df: pd.DataFrame, ratings_df: pd.DataFrame | None 
             glicko_rating = _fval(row_r.get("glicko_rating"), 1500.0)
             glicko_rd     = _fval(row_r.get("glicko_rd"),     350.0)
 
+    # Exponentially-weighted stat lookup from pre-computed EW file
+    ew_stats: dict = {f"ew_{s}": 0.0 for s in EW_STAT_COLS}
+    if ew_df is not None and not ew_df.empty and "fighter" in ew_df.columns:
+        mask = ew_df["fighter"].apply(normalize_name) == matched
+        if mask.any():
+            row_e = ew_df[mask].iloc[0]
+            for stat in EW_STAT_COLS:
+                ew_stats[f"ew_{stat}"] = _fval(row_e.get(f"ew_{stat}"), 0.0)
+
     return {
         "name":               matched,
         "last_fight_date":    latest["date"],
@@ -234,6 +254,7 @@ def lookup_fighter(name: str, df: pd.DataFrame, ratings_df: pd.DataFrame | None 
         "glicko_rd":          glicko_rd,
         **form,
         **absorbed,
+        **ew_stats,
     }
 
 
@@ -304,6 +325,10 @@ def build_feature_vector(
         "td_net_rate_delta":          stats_a["td_net_rate"]          - stats_b["td_net_rate"],
         "glicko_rating_delta":        stats_a["glicko_rating"]        - stats_b["glicko_rating"],
         "glicko_rd_delta":            stats_a["glicko_rd"]            - stats_b["glicko_rd"],
+        **{
+            f"ew_{stat}_delta": stats_a[f"ew_{stat}"] - stats_b[f"ew_{stat}"]
+            for stat in EW_STAT_COLS
+        },
     }
 
     # Style one-hot columns
@@ -515,7 +540,9 @@ def _load_all(csv_path: str) -> tuple:
             df[f"{corner}_ko_finish_rate"] = (ko / wins).clip(0, 1)
         ratings_path = os.path.join(DATA_DIR, "fighter_ratings.csv")
         ratings_df = pd.read_csv(ratings_path) if os.path.exists(ratings_path) else pd.DataFrame()
-        _cache["bundle"] = (model, feature_cols, kmeans, scaler, labels, cluster_features, df, ratings_df)
+        ew_path = os.path.join(DATA_DIR, "fighter_ew_stats.csv")
+        ew_df = pd.read_csv(ew_path) if os.path.exists(ew_path) else pd.DataFrame()
+        _cache["bundle"] = (model, feature_cols, kmeans, scaler, labels, cluster_features, df, ratings_df, ew_df)
     return _cache["bundle"]
 
 
@@ -532,12 +559,12 @@ def predict_matchup(
     if csv_path is None:
         csv_path = os.path.join(DATA_DIR, "raw", "ufc-master.csv")
 
-    model, feature_cols, kmeans, scaler, labels, cluster_features, df, ratings_df = _load_all(csv_path)
+    model, feature_cols, kmeans, scaler, labels, cluster_features, df, ratings_df, ew_df = _load_all(csv_path)
 
     if verbose:
         print(f"\nLooking up fighters...")
-    stats_a = lookup_fighter(name_a, df, ratings_df)
-    stats_b = lookup_fighter(name_b, df, ratings_df)
+    stats_a = lookup_fighter(name_a, df, ratings_df, ew_df)
+    stats_b = lookup_fighter(name_b, df, ratings_df, ew_df)
 
     # Assign styles using the cluster model
     from cluster import predict_style

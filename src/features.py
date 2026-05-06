@@ -41,6 +41,9 @@ STAT_COLS = [
     "ko_finish_rate",   # derived below
 ]
 
+# Stats that get exponentially-weighted counterparts (decay_rate = 0.13/year)
+EW_STAT_COLS = STAT_COLS
+
 # Ordinal encoding ordered by weight limit. Each class gets a unique integer so
 # XGBoost can learn division-specific patterns (KO rates, grappling dominance, etc.)
 WEIGHT_CLASS_ORD: dict[str, int] = {
@@ -58,6 +61,10 @@ WEIGHT_CLASS_ORD: dict[str, int] = {
     "Heavyweight":          12,   # 265 lbs
     "Catch Weight":          6,   # map to mid-range
 }
+
+# Exponential time-decay rate for career stat averages (per year)
+# Weight for a fight t years ago = exp(-0.13 * t); ~8-year-old fight weighs ~3x less than a recent one
+_EW_DECAY = 0.13
 
 # Glicko-2 hyperparameters
 _GLICKO_TAU         = 0.5       # system constant — limits how fast volatility changes
@@ -420,6 +427,14 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
                                 errors="coerce").fillna(fill)
             rows[f"{stat}_delta"] = (sign * (r_v - b_v)).values
 
+        # Exponentially-weighted stat deltas (columns added by add_ew_stats)
+        for stat in EW_STAT_COLS:
+            r_v = pd.to_numeric(df.get(f"R_ew_{stat}", pd.Series(0.0, index=df.index)),
+                                errors="coerce").fillna(0.0)
+            b_v = pd.to_numeric(df.get(f"B_ew_{stat}", pd.Series(0.0, index=df.index)),
+                                errors="coerce").fillna(0.0)
+            rows[f"ew_{stat}_delta"] = (sign * (r_v - b_v)).values
+
         perspectives.append(pd.DataFrame(rows))
 
     return (
@@ -604,6 +619,104 @@ def add_absorbed_stats(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Exponentially-weighted career stat averages
+# ---------------------------------------------------------------------------
+
+def add_ew_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace simple career averages with exponentially time-decayed equivalents.
+    Each historical fight contributes weight exp(-0.13 * years_ago), so fights
+    from ~8 years ago weigh roughly 1/3 as much as fights from last month.
+
+    Adds columns:
+        {R,B}_ew_{stat}  for each stat in EW_STAT_COLS
+
+    Also saves data/fighter_ew_stats.csv so predict.py can look up current values.
+    """
+    df = df.copy().sort_values("date").reset_index(drop=True)
+    n = len(df)
+
+    # State per fighter per stat: [ew_num, ew_den, last_avg, last_n, last_date]
+    state: dict = {}
+
+    out: dict[str, np.ndarray] = {}
+    for stat in EW_STAT_COLS:
+        out[f"R_ew_{stat}"] = np.zeros(n)
+        out[f"B_ew_{stat}"] = np.zeros(n)
+
+    def _n_fights(row, corner: str) -> float:
+        w = max(float(row.get(f"{corner}_wins",   0) or 0), 0)
+        l = max(float(row.get(f"{corner}_losses", 0) or 0), 0)
+        d = max(float(row.get(f"{corner}_draw",   0) or 0), 0)
+        return w + l + d
+
+    for i in range(n):
+        row        = df.iloc[i]
+        fight_date = row["date"]
+        r_name     = normalize_name(str(row["R_fighter"]))
+        b_name     = normalize_name(str(row["B_fighter"]))
+
+        for corner, name in [("R", r_name), ("B", b_name)]:
+            if name not in state:
+                state[name] = {s: [0.0, 0.0, 0.0, 0.0, None] for s in EW_STAT_COLS}
+
+            n_cur = _n_fights(row, corner)
+
+            for stat in EW_STAT_COLS:
+                ew_num, ew_den, last_avg, last_n, last_date = state[name][stat]
+
+                # Decay existing EW sums since last appearance
+                if last_date is not None:
+                    years = (fight_date - last_date).days / 365.25
+                    factor = np.exp(-_EW_DECAY * years)
+                    ew_num *= factor
+                    ew_den *= factor
+
+                # Record pre-fight EW average (no leakage — before update)
+                out[f"{corner}_ew_{stat}"][i] = ew_num / ew_den if ew_den > 0 else 0.0
+
+                # Read pre-fight cumulative avg from dataset
+                col = f"{corner}_ko_finish_rate" if stat == "ko_finish_rate" else f"{corner}_{stat}"
+                cur_avg = 0.0
+                if col in df.columns:
+                    v = df.at[i, col]
+                    try:
+                        fv = float(v)
+                        cur_avg = 0.0 if fv != fv else fv  # guard NaN
+                    except (TypeError, ValueError):
+                        pass
+
+                # Back-calculate per-fight contribution and update EW state
+                # cur_avg is the average over n_cur previous fights;
+                # last_avg was the average over last_n previous fights.
+                # Δ = cur_avg * n_cur - last_avg * last_n  (stat total added since last row)
+                if n_cur > last_n:
+                    n_new = n_cur - last_n
+                    delta = cur_avg * n_cur - last_avg * last_n
+                    ew_num += delta
+                    ew_den += n_new
+
+                state[name][stat] = [ew_num, ew_den, cur_avg, n_cur, fight_date]
+
+    for col, arr in out.items():
+        df[col] = arr
+
+    # Persist final EW values for predict.py lookups
+    records = []
+    for name, stats in state.items():
+        rec = {"fighter": name}
+        for stat, (ew_num, ew_den, *_) in stats.items():
+            rec[f"ew_{stat}"] = ew_num / ew_den if ew_den > 0 else 0.0
+        records.append(rec)
+    ew_df = pd.DataFrame(records)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    ew_path = os.path.join(DATA_DIR, "fighter_ew_stats.csv")
+    ew_df.to_csv(ew_path, index=False)
+    print(f"  EW stats computed for {len(records):,} fighters → {ew_path}")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Weight class ordinal encoding
 # ---------------------------------------------------------------------------
 
@@ -695,6 +808,9 @@ def main(csv_path: str) -> None:
 
     print("Computing Glicko-2 ratings...")
     df = add_glicko_ratings(df)
+
+    print("Computing exponentially-weighted career stats...")
+    df = add_ew_stats(df)
 
     print("Building doubled feature matrix...")
     features = build_feature_matrix(df)
