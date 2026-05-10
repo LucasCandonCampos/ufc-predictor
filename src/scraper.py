@@ -244,6 +244,10 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
            "ctrl_secs":      [0, 0],
            "head_landed":    [0, 0], "body_landed":  [0, 0], "leg_landed": [0, 0]}
 
+    # Per-round data — one entry per round in table order
+    per_round: list[dict] = []
+    rd_idx = 0
+
     for row in tables[0].select("tr"):
         cells = row.select("td")
         if not cells or len(cells) < 8:
@@ -251,8 +255,10 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
         # Cell index:  0=names, 1=KD, 2=sig_str(x/y), 3=sig_str%, 4=total_str,
         #              5=TD(x/y), 6=TD%, 7=sub_att, 8=rev, 9=ctrl
         v0, v1 = _split_cell(cells[1])
-        agg["kd"][0] += int(v0) if v0.isdigit() else 0
-        agg["kd"][1] += int(v1) if v1.isdigit() else 0
+        kd0 = int(v0) if v0.isdigit() else 0
+        kd1 = int(v1) if v1.isdigit() else 0
+        agg["kd"][0] += kd0
+        agg["kd"][1] += kd1
 
         s0, s1 = _split_cell(cells[2])
         l0, a0 = _x_of_y(s0);  l1, a1 = _x_of_y(s1)
@@ -265,13 +271,29 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
         agg["td_landed"][1] += tl1;  agg["td_att"][1] += ta1
 
         u0, u1 = _split_cell(cells[7])
-        agg["sub_att"][0] += int(u0) if u0.isdigit() else 0
-        agg["sub_att"][1] += int(u1) if u1.isdigit() else 0
+        sa0 = int(u0) if u0.isdigit() else 0
+        sa1 = int(u1) if u1.isdigit() else 0
+        agg["sub_att"][0] += sa0
+        agg["sub_att"][1] += sa1
 
+        ctrl0 = ctrl1 = 0
         if len(cells) > 9:
             c0, c1 = _split_cell(cells[9])
-            agg["ctrl_secs"][0] += _parse_ctrl_secs(c0)
-            agg["ctrl_secs"][1] += _parse_ctrl_secs(c1)
+            ctrl0 = _parse_ctrl_secs(c0)
+            ctrl1 = _parse_ctrl_secs(c1)
+            agg["ctrl_secs"][0] += ctrl0
+            agg["ctrl_secs"][1] += ctrl1
+
+        rd_idx += 1
+        per_round.append({
+            "round":   rd_idx,
+            "ssl_0":   l0,   "ssa_0":  a0,
+            "tdl_0":   tl0,  "tda_0":  ta0,
+            "kd_0":    kd0,  "ctrl_0": ctrl0,
+            "ssl_1":   l1,   "ssa_1":  a1,
+            "tdl_1":   tl1,  "tda_1":  ta1,
+            "kd_1":    kd1,  "ctrl_1": ctrl1,
+        })
 
     # Table 1: Significant Strikes breakdown (head / body / leg)
     # Columns: 0=names, 1=sig_str(x/y), 2=head(x/y), 3=body(x/y), 4=leg(x/y), ...
@@ -318,6 +340,7 @@ def fetch_fight_stats(fight_url: str) -> dict | None:
         "finish_details": finish_details,
         "stats_0":       _stats(0),
         "stats_1":       _stats(1),
+        "per_round":     per_round,   # list of dicts, one per round; empty if only totals row
     }
 
 
@@ -588,6 +611,41 @@ def build_row(
 
 
 # ---------------------------------------------------------------------------
+# Round stats writer
+# ---------------------------------------------------------------------------
+
+ROUND_CSV = os.path.join(ROOT, "data", "round_stats.csv")
+_ROUND_COLS = [
+    "fight_url", "date", "fighter_0", "fighter_1",
+    "round",
+    "ssl_0", "ssa_0", "tdl_0", "tda_0", "kd_0", "ctrl_0",
+    "ssl_1", "ssa_1", "tdl_1", "tda_1", "kd_1", "ctrl_1",
+]
+
+
+def _append_round_stats(
+    per_round: list[dict],
+    fight_url: str,
+    fight_date,
+    fighter_0: str,
+    fighter_1: str,
+) -> None:
+    """Append per-round stats rows to round_stats.csv."""
+    rows = []
+    for rd in per_round:
+        rows.append({
+            "fight_url": fight_url,
+            "date":      str(fight_date),
+            "fighter_0": fighter_0,
+            "fighter_1": fighter_1,
+            **rd,
+        })
+    new_df = pd.DataFrame(rows, columns=_ROUND_COLS)
+    write_header = not os.path.exists(ROUND_CSV)
+    new_df.to_csv(ROUND_CSV, mode="a", header=write_header, index=False)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -635,11 +693,30 @@ def main(dry_run: bool = False) -> None:
                 print("SKIP (parse failed)")
                 continue
 
-            is_draw     = fight["winner_idx"] == -1
-            r_name      = detail["fighter_0"]   # first listed = winner = Red
-            b_name      = detail["fighter_1"]
-            r_won       = not is_draw
-            b_won       = False
+            # Use winner_name from the fight detail page (determined via W/L status flag)
+            # rather than assuming fighter_0 is always the winner.
+            winner_name = detail.get("winner_name")
+            is_draw     = winner_name is None
+
+            if is_draw:
+                r_name    = detail["fighter_0"]
+                b_name    = detail["fighter_1"]
+                r_stats_d = detail["stats_0"]
+                b_stats_d = detail["stats_1"]
+            elif winner_name.strip().lower() == detail["fighter_0"].strip().lower():
+                r_name    = detail["fighter_0"]
+                b_name    = detail["fighter_1"]
+                r_stats_d = detail["stats_0"]
+                b_stats_d = detail["stats_1"]
+            else:
+                # fighter_1 is the actual winner — swap R/B assignment and stats
+                r_name    = detail["fighter_1"]
+                b_name    = detail["fighter_0"]
+                r_stats_d = detail["stats_1"]
+                b_stats_d = detail["stats_0"]
+
+            r_won = not is_draw
+            b_won = False
 
             # Look up existing career stats
             r_old, r_c = _get_latest_fighter_row(r_name, df)
@@ -650,13 +727,13 @@ def main(dry_run: bool = False) -> None:
                 b_c = "B"
 
             r_stats = update_career_stats(
-                r_old, r_c, detail["stats_0"],
+                r_old, r_c, r_stats_d,
                 detail["total_secs"], detail["finish_round"],
                 won=r_won, is_draw=is_draw,
                 method=detail["method"], prefix="R_",
             )
             b_stats = update_career_stats(
-                b_old, b_c, detail["stats_1"],
+                b_old, b_c, b_stats_d,
                 detail["total_secs"], detail["finish_round"],
                 won=b_won, is_draw=is_draw,
                 method=detail["method"], prefix="B_",
@@ -673,6 +750,15 @@ def main(dry_run: bool = False) -> None:
             row["R_fighter"] = r_name
             row["B_fighter"] = b_name
             new_rows.append(row)
+
+            # Save per-round data if the table had multiple rows (one per round)
+            per_rd = detail.get("per_round", [])
+            if len(per_rd) > 1:
+                _append_round_stats(
+                    per_rd, fight["fight_url"], ev["date"],
+                    r_name, b_name,
+                )
+
             print(f"OK  ({detail['method']}, R{detail['finish_round']} {detail['finish_time']})")
 
     if not new_rows:

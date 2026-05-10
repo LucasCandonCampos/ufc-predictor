@@ -44,7 +44,11 @@ FEATURES_CSV = os.path.join(DATA_DIR, "matchup_features.csv")
 EXCLUDE_COLS = {
     "fight_id", "a_fighter", "b_fighter", "date", "weight_class",
     "a_won", "a_style", "b_style", "style_matchup",
+    "finish_method", "finish_round_grp", "no_of_rounds",
 }
+
+METHOD_LABELS = ["KO/TKO", "Submission", "Decision"]
+ROUND_LABELS  = [1, 2, 3, 4]   # 4 = "Round 4+"
 
 XGBOOST_PARAMS = dict(
     n_estimators=200,
@@ -348,6 +352,78 @@ def save_model(
 
 
 # ---------------------------------------------------------------------------
+# Finish-method and finish-round models
+# ---------------------------------------------------------------------------
+
+def train_method_model(df: pd.DataFrame, feature_cols: list[str]) -> None:
+    """
+    Train a multiclass XGBoost model to predict how the fight ends:
+    KO/TKO (0), Submission (1), or Decision (2).
+    Drops ~24 DQ/CNC/Overturned rows where finish_method is NaN.
+    """
+    filtered = df[df["finish_method"].notna()].copy()
+    label_map = {"KO/TKO": 0, "Submission": 1, "Decision": 2}
+    filtered["_target"] = filtered["finish_method"].map(label_map)
+
+    test_cut = df["date"].quantile(0.80)
+    train = filtered[filtered["date"] <= test_cut]
+    test  = filtered[filtered["date"] >  test_cut]
+
+    print(f"\n[Method model]  train={len(train):,}  test={len(test):,}")
+
+    params = {**XGBOOST_PARAMS, "n_estimators": 150}
+    clf = xgb.XGBClassifier(objective="multi:softprob", num_class=3, **params)
+    clf.fit(train[feature_cols], train["_target"].values)
+
+    if len(test) > 0:
+        preds = clf.predict(test[feature_cols])
+        acc = accuracy_score(test["_target"].values, preds)
+        print(f"[Method model]  test accuracy: {acc:.1%}")
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    path = os.path.join(MODELS_DIR, "method_model.pkl")
+    with open(path, "wb") as f:
+        pickle.dump({"model": clf, "feature_cols": feature_cols, "labels": METHOD_LABELS}, f)
+    print(f"[Method model]  saved → {path}")
+
+
+def train_round_model(df: pd.DataFrame, feature_cols: list[str]) -> None:
+    """
+    Train a multiclass XGBoost model to predict finish round for non-Decision fights.
+    Target groups: 1→0, 2→1, 3→2, 4+→3 (XGBoost needs 0-indexed classes).
+    Includes no_of_rounds as an extra feature (3-round vs 5-round fight).
+    """
+    filtered = df[
+        (df["finish_method"] != "Decision") & df["finish_round_grp"].notna()
+    ].copy()
+    filtered["_target"] = filtered["finish_round_grp"].astype(int) - 1  # 1-indexed → 0-indexed
+
+    # Include no_of_rounds as extra feature for round model
+    round_feature_cols = feature_cols + ["no_of_rounds"]
+
+    test_cut = df["date"].quantile(0.80)
+    train = filtered[filtered["date"] <= test_cut]
+    test  = filtered[filtered["date"] >  test_cut]
+
+    print(f"\n[Round model]  train={len(train):,}  test={len(test):,}")
+
+    params = {**XGBOOST_PARAMS, "n_estimators": 150}
+    clf = xgb.XGBClassifier(objective="multi:softprob", num_class=4, **params)
+    clf.fit(train[round_feature_cols], train["_target"].values)
+
+    if len(test) > 0:
+        preds = clf.predict(test[round_feature_cols])
+        acc = accuracy_score(test["_target"].values, preds)
+        print(f"[Round model]  test accuracy: {acc:.1%}")
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    path = os.path.join(MODELS_DIR, "round_model.pkl")
+    with open(path, "wb") as f:
+        pickle.dump({"model": clf, "feature_cols": round_feature_cols, "labels": ROUND_LABELS}, f)
+    print(f"[Round model]  saved → {path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -371,6 +447,13 @@ def main() -> None:
     save_calibration_plot(model_raw, model_cal, test, feature_cols)
 
     save_model(model_cal, feature_cols, test_cut, results)
+
+    print("\nTraining finish-method model...")
+    train_method_model(df, feature_cols)
+
+    print("\nTraining finish-round model...")
+    train_round_model(df, feature_cols)
+
     print("\nStep 3 complete.")
 
 

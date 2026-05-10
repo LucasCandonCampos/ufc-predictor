@@ -33,11 +33,13 @@ from sklearn.metrics import silhouette_score
 # Note: avg_KD, SIG_STR_def, TD_def are absent from this dataset — ko_finish_rate
 # is derived in extract_career_stats() as a KO-power proxy instead.
 STYLE_FEATURES = [
-    "avg_SIG_STR_pct",    # striking accuracy
-    "avg_SIG_STR_landed", # striking volume (output per 15 min)
+    "avg_SIG_STR_pct",    # striking accuracy (scale-stable across all eras)
     "avg_TD_pct",         # takedown accuracy
-    "avg_TD_landed",      # takedown volume (grappling aggression)
-    "avg_SUB_ATT",        # submission attempts per 15 min
+    "avg_TD_landed",      # takedown volume (per-fight avg, consistent pre/post 2020)
+    "avg_SUB_ATT",        # submission attempts per fight
+    # avg_SIG_STR_landed intentionally excluded: pre-2020 values are raw per-fight totals
+    # (~30 mean) while post-2020 values are per-minute rates (~4.6 mean) — 7x scale
+    # gap causes the Volume_Striker centroid to be unreachable for all modern fighters.
 ]
 
 # Extra columns needed only to derive ko_finish_rate; not used directly as features.
@@ -211,20 +213,15 @@ def label_clusters(
     cz = (centroids - centroids.mean()) / (centroids.std() + 1e-9)
 
     # Positive weight = feature should be elevated; negative = should be low.
-    # Archetypes reflect what this dataset actually separates:
-    #   Pressure Striker  — wins by KO/TKO (high finish rate is the defining signal)
-    #   Volume Striker    — high strike output, wins by decision (low KO rate)
-    #   Wrestler/Grappler — takedown-dominant, high sub attempts
-    #   Well-Rounded      — fallback for balanced clusters
-    # Counter Fighter omitted: requires SIG_STR_def/TD_def which are absent.
+    # avg_SIG_STR_landed removed (7x scale gap pre/post 2020), so Volume_Striker
+    # is redefined as high-accuracy, low-KO-rate (decision-hunter) using pct.
     archetypes: dict[str, dict[str, float]] = {
-        "Pressure Striker":      {"ko_finish_rate": 2.5, "avg_SIG_STR_landed": 0.5},
-        "Volume Striker":        {"avg_SIG_STR_landed": 2.5, "ko_finish_rate": -1.5},
-        "Wrestler/Grappler":     {"avg_TD_pct": 2.0, "avg_TD_landed": 1.5,
-                                  "avg_SIG_STR_landed": -0.5},
-        "Submission Grappler":   {"avg_SUB_ATT": 2.5, "ko_finish_rate": -1.0,
-                                  "avg_SIG_STR_landed": -0.5},
-        "Well-Rounded":          {},
+        "Pressure Striker":    {"ko_finish_rate": 2.5},
+        "Volume Striker":      {"avg_SIG_STR_pct": 1.5, "ko_finish_rate": -1.5,
+                                "avg_TD_pct": -0.5},
+        "Wrestler/Grappler":   {"avg_TD_pct": 2.0, "avg_TD_landed": 1.5},
+        "Submission Grappler": {"avg_SUB_ATT": 2.5, "ko_finish_rate": -1.0},
+        "Well-Rounded":        {},
     }
 
     labels: dict[int, str] = {}

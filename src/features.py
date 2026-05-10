@@ -26,6 +26,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 from cluster import load_raw_data, normalize_name, load_models
+from fatigue import build_proxy_fatigue, FATIGUE_COLS
 
 ROOT     = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(ROOT, "data")
@@ -447,6 +448,40 @@ def add_glicko_ratings(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Fatigue features
+# ---------------------------------------------------------------------------
+
+def add_fatigue_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute per-fighter proxy fatigue profiles from the full fight history and
+    merge them onto each fight row as {R,B}_<fatigue_col> columns.
+
+    Profiles are also saved to data/fighter_fatigue.csv for predict.py lookups.
+    """
+    profiles = build_proxy_fatigue(df, save=True)
+    # Build a lookup dict: normalised_name → fatigue row
+    lookup: dict[str, dict] = {}
+    for _, row in profiles.iterrows():
+        key = normalize_name(str(row.get("fighter", "")))
+        if key:
+            lookup[key] = {c: float(row.get(c, 0.0)) for c in FATIGUE_COLS}
+
+    defaults = {c: 0.0 for c in FATIGUE_COLS}
+    defaults["cardio_score"] = 0.7
+
+    df = df.copy()
+    for corner in ("R", "B"):
+        names = df[f"{corner}_fighter"].apply(lambda n: normalize_name(str(n)))
+        for col in FATIGUE_COLS:
+            df[f"{corner}_{col}"] = names.map(
+                lambda n, c=col: lookup.get(n, defaults)[c]
+            )
+
+    print(f"  Fatigue profiles merged for {len(lookup):,} fighters")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Feature matrix assembly
 # ---------------------------------------------------------------------------
 
@@ -465,6 +500,27 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     for a, b in [("R", "B"), ("B", "R")]:
         is_r_perspective = (a == "R")
 
+        # Normalize finish_method: Decision / KO/TKO / Submission / NaN
+        finish_raw = df["finish"].fillna("").astype(str).str.upper() if "finish" in df.columns else pd.Series("", index=df.index)
+        finish_method = finish_raw.map(lambda f: (
+            "Decision"   if f in ("U-DEC", "S-DEC", "M-DEC") else
+            "KO/TKO"     if f == "KO/TKO" else
+            "Submission" if f == "SUB" else
+            np.nan
+        ))
+
+        # finish_round_grp: only for non-Decision fights (1, 2, 3, or 4=grouped 4+5)
+        finish_round_raw = pd.to_numeric(df["finish_round"], errors="coerce") if "finish_round" in df.columns else pd.Series(np.nan, index=df.index)
+        finish_round_grp = pd.Series(np.nan, index=df.index, dtype=object)
+        non_dec_mask = finish_method != "Decision"
+        finish_round_grp[non_dec_mask & (finish_round_raw == 1.0)] = 1
+        finish_round_grp[non_dec_mask & (finish_round_raw == 2.0)] = 2
+        finish_round_grp[non_dec_mask & (finish_round_raw == 3.0)] = 3
+        finish_round_grp[non_dec_mask & (finish_round_raw.isin([4.0, 5.0]))] = 4
+
+        # no_of_rounds passthrough (3-round vs 5-round fight)
+        no_of_rounds_vals = pd.to_numeric(df["no_of_rounds"], errors="coerce").fillna(3) if "no_of_rounds" in df.columns else pd.Series(3, index=df.index)
+
         rows: dict = {
             "fight_id":     df.index.values,
             "a_fighter":    df[f"{a}_fighter"].apply(normalize_name).values,
@@ -481,6 +537,10 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
             ),
             "a_low_data":   (_total_fights(df, a) < 3).astype(int).values,
             "b_low_data":   (_total_fights(df, b) < 3).astype(int).values,
+            # Passthrough target columns (same value for both perspectives — not sign-flipped)
+            "finish_method":    finish_method.values,
+            "finish_round_grp": finish_round_grp.values,
+            "no_of_rounds":     no_of_rounds_vals.values,
         }
 
         # Sign multiplier: +1 for A=R perspective, -1 for A=B (negates all deltas)
@@ -581,6 +641,9 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
             b_v = pd.to_numeric(df.get(f"B_{stat}", pd.Series(fill, index=df.index)),
                                 errors="coerce").fillna(fill)
             rows[f"{stat}_delta"] = (sign * (r_v - b_v)).values
+
+        # Round-by-round degradation slopes added via add_round_degradation()
+        # after build_feature_matrix() — see main().
 
         perspectives.append(pd.DataFrame(rows))
 
@@ -930,6 +993,150 @@ def print_sanity_check(df: pd.DataFrame) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def add_round_degradation(features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge per-fighter round-curve degradation slopes as delta features.
+
+    Uses round_stats.csv built by round_scraper.py.  Slopes are career-average
+    patterns (how much output/accuracy/TD-defense fades per round) and are
+    relatively stable over a fighter's career — similar leakage profile to the
+    K-means style assignments which also use all-time career stats.
+
+    Original columns:
+        output_drop_per_rd_delta    — A minus B sig-strikes-per-round slope
+        accuracy_drop_per_rd_delta  — A minus B sig-str-pct slope
+        td_def_drop_per_rd_delta    — A minus B TD-defense slope
+        degradation_score_delta     — composite cardio score (A minus B)
+    New grappling-inclusive columns:
+        activity_drop_per_rd_delta  — grappling-inclusive slope (strikes + TDs + ctrl)
+        champ_round_activity_delta  — rounds 4-5 avg output (A minus B); fighters
+                                      without championship round data get median fill
+        fade_score_delta            — length-adjusted proportional fade (A minus B)
+        late_activity_abs_delta     — absolute late-round (rd 3+) combined output delta
+    """
+    from fatigue import build_round_fatigue, ROUND_CSV
+
+    round_csv = os.path.join(DATA_DIR, "round_stats.csv")
+    if not os.path.exists(round_csv):
+        print("  round_stats.csv not found — skipping degradation features")
+        return features
+
+    print("  Loading round degradation curves from round_stats.csv…")
+    curves = build_round_fatigue(min_fights=2)
+    if curves.empty:
+        print("  No round curves computed — skipping")
+        return features
+
+    # Normalise fighter name for merge
+    def _norm(n): return str(n).strip().lower()
+    curves["_name"] = curves["fighter"].apply(_norm)
+
+    # Fighters without championship round data (never reached rd 4) get median fill
+    # so their delta vs other prelim fighters is ~0 rather than penalising them.
+    champ_median = curves["champ_round_activity"].dropna().median()
+    late_median  = curves["late_activity_abs"].dropna().median()
+    curves["champ_round_activity"] = curves["champ_round_activity"].fillna(champ_median)
+    curves["late_activity_abs"]    = curves["late_activity_abs"].fillna(late_median)
+
+    deg_cols = [
+        "output_drop_per_rd",
+        "accuracy_drop_per_rd",
+        "td_def_drop_per_rd",
+        "degradation_score",
+        "activity_drop_per_rd",
+        "champ_round_activity",
+        "fade_score",
+        "late_activity_abs",
+    ]
+
+    defaults = {c: 0.0 for c in deg_cols}
+    defaults["champ_round_activity"] = float(champ_median) if pd.notna(champ_median) else 0.0
+    defaults["late_activity_abs"]    = float(late_median)  if pd.notna(late_median)  else 0.0
+
+    lookup = curves.set_index("_name")[deg_cols].to_dict("index")
+
+    for side in ("a", "b"):
+        col = f"{side}_fighter"
+        for dc in deg_cols:
+            features[f"_{side}_{dc}"] = features[col].apply(
+                lambda n: lookup.get(_norm(n), defaults)[dc]
+            )
+
+    for dc in deg_cols:
+        features[f"{dc}_delta"] = features[f"_a_{dc}"] - features[f"_b_{dc}"]
+        features.drop(columns=[f"_a_{dc}", f"_b_{dc}"], inplace=True)
+
+    print(f"  Added {len(deg_cols)} degradation delta features for "
+          f"{len(curves)} fighters")
+    return features
+
+
+def add_chin_power_features(features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge per-fighter chin/durability and KO-power scores as delta features.
+
+    Same post-build_feature_matrix pattern as add_round_degradation().
+    Columns added (all A-minus-B deltas):
+        chin_score_delta         — composite chin score (higher = A tougher)
+        kd_surplus_adj_delta     — opponent-adjusted KD absorption (lower = A absorbs fewer)
+        ko_loss_rate_adj_delta   — wc-normalised KO-loss rate (lower = A less vulnerable)
+        power_score_delta        — composite striking power (higher = A more dangerous)
+        kd_per_100_off_delta     — KDs scored per 100 strikes (higher = A harder hitter)
+        ko_win_rate_adj_delta    — wc-normalised KO-win rate (higher = A more finishing)
+
+    Fighters not found in the chin/power profiles get population-median values so
+    their delta vs a known opponent reflects "average" rather than 0.
+    """
+    from chin import build_chin_profiles, build_ko_power_profiles, CHIN_COLS, POWER_COLS
+
+    chin_df  = build_chin_profiles(min_fights=3)
+    power_df = build_ko_power_profiles(min_fights=3)
+
+    if chin_df.empty and power_df.empty:
+        print("  No chin/power data — skipping")
+        return features
+
+    def _norm(n): return str(n).strip().lower()
+
+    chin_defaults = {c: float(chin_df[c].median()) if c in chin_df.columns else 0.0
+                     for c in CHIN_COLS}
+    power_defaults = {c: float(power_df[c].median()) if c in power_df.columns else 0.0
+                      for c in POWER_COLS}
+
+    chin_lookup: dict = {}
+    for _, row in chin_df.iterrows():
+        key = _norm(str(row.get("fighter", "")))
+        if key:
+            chin_lookup[key] = {c: float(row.get(c, chin_defaults[c])) for c in CHIN_COLS}
+
+    power_lookup: dict = {}
+    for _, row in power_df.iterrows():
+        key = _norm(str(row.get("fighter", "")))
+        if key:
+            power_lookup[key] = {c: float(row.get(c, power_defaults[c])) for c in POWER_COLS}
+
+    all_cols = CHIN_COLS + POWER_COLS
+
+    for side in ("a", "b"):
+        col = f"{side}_fighter"
+        for dc in CHIN_COLS:
+            features[f"_{side}_{dc}"] = features[col].apply(
+                lambda n, _dc=dc: chin_lookup.get(_norm(n), chin_defaults).get(_dc, chin_defaults.get(_dc, 0.0))
+            )
+        for dc in POWER_COLS:
+            features[f"_{side}_{dc}"] = features[col].apply(
+                lambda n, _dc=dc: power_lookup.get(_norm(n), power_defaults).get(_dc, power_defaults.get(_dc, 0.0))
+            )
+
+    for dc in all_cols:
+        features[f"{dc}_delta"] = features[f"_a_{dc}"] - features[f"_b_{dc}"]
+        features.drop(columns=[f"_a_{dc}", f"_b_{dc}"], inplace=True)
+
+    print(f"  Added {len(all_cols)} chin/power delta features for "
+          f"{len(chin_lookup)} chin / {len(power_lookup)} power profiles")
+    return features
+
+
 def main(csv_path: str) -> None:
     print("Loading data and cluster models...")
     df              = load_raw_data(csv_path)
@@ -970,6 +1177,12 @@ def main(csv_path: str) -> None:
 
     print("One-hot encoding styles...")
     features = add_style_onehot(features)
+
+    print("Adding round degradation features...")
+    features = add_round_degradation(features)
+
+    print("Adding chin/KO-power features...")
+    features = add_chin_power_features(features)
 
     print("Encoding weight class...")
     features = add_weight_class_ordinal(features)

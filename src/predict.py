@@ -20,6 +20,11 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(__file__))
 from cluster import load_raw_data, normalize_name, load_models as load_cluster_models
 from features import WEIGHT_CLASS_ORD, EW_STAT_COLS
+from fatigue import (  # noqa: F401
+    load_fatigue_profiles, lookup_fighter_fatigue, FATIGUE_COLS,
+    load_round_curve_profiles, ROUND_CURVE_COLS,
+)
+from chin import load_chin_power_profiles, CHIN_COLS, POWER_COLS
 from calibration import _CalibratedModel  # noqa: F401 — required for pickle to resolve the class
 
 ROOT       = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
@@ -73,10 +78,26 @@ FEATURE_LABELS: dict[str, str] = {
     "ew_ctrl_rate_delta":          "EW submission win rate",
     "a_age":                       "Fighter A age",
     "b_age":                       "Fighter B age",
-    "decision_rate_delta":         "Decision win rate",
-    "finish_loss_rate_delta":      "Finish vulnerability",
-    "punch_finish_rate_delta":     "Punch/elbow KO rate",
-    "kick_finish_rate_delta":      "Kick/knee KO rate",
+    "decision_rate_delta":              "Decision win rate",
+    "finish_loss_rate_delta":           "Finish vulnerability",
+    "punch_finish_rate_delta":          "Punch/elbow KO rate",
+    "kick_finish_rate_delta":           "Kick/knee KO rate",
+    "output_drop_per_rd_delta":         "Output degradation per round",
+    "accuracy_drop_per_rd_delta":       "Accuracy degradation per round",
+    "td_def_drop_per_rd_delta":         "TD defense degradation per round",
+    "degradation_score_delta":          "Cardio degradation score",
+    "activity_drop_per_rd_delta":       "Activity fade per round (incl. grappling)",
+    "champ_round_activity_delta":       "Championship round output (rds 4-5)",
+    "fade_score_delta":                 "Cardio fade (length-adjusted)",
+    "late_activity_abs_delta":          "Late-round output (rd 3+)",
+    # Chin / durability
+    "chin_score_delta":                 "Chin / KO durability",
+    "kd_surplus_adj_delta":             "Opp-adjusted KD absorption",
+    "ko_loss_rate_adj_delta":           "KO vulnerability (wc-normalised)",
+    # KO power
+    "power_score_delta":                "Striking KO power",
+    "kd_per_100_off_delta":             "Offensive KD rate per 100 strikes",
+    "ko_win_rate_adj_delta":            "KO win rate (wc-normalised)",
 }
 
 
@@ -350,6 +371,12 @@ def build_feature_vector(
     style_b: str,
     winrate: float,
     feature_cols: list[str],
+    round_curve_lookup: dict | None = None,
+    round_curve_defaults: dict | None = None,
+    chin_lookup: dict | None = None,
+    chin_defaults: dict | None = None,
+    power_lookup: dict | None = None,
+    power_defaults: dict | None = None,
 ) -> pd.DataFrame:
     """Build a single-row feature DataFrame in the exact format the model expects."""
     today = pd.Timestamp.now()
@@ -400,6 +427,44 @@ def build_feature_vector(
         },
     }
 
+    # Round degradation delta features (old strike-based slopes)
+    _DEG_COLS = ["output_drop_per_rd", "accuracy_drop_per_rd",
+                 "td_def_drop_per_rd", "degradation_score"]
+    if any(f"{c}_delta" in feature_cols for c in _DEG_COLS):
+        fat_profiles = load_fatigue_profiles()
+        fat_a = lookup_fighter_fatigue(stats_a["name"], fat_profiles)
+        fat_b = lookup_fighter_fatigue(stats_b["name"], fat_profiles)
+        for c in _DEG_COLS:
+            row[f"{c}_delta"] = fat_a.get(c, 0.0) - fat_b.get(c, 0.0)
+
+    # New grappling-inclusive round-curve delta features
+    if any(f"{c}_delta" in feature_cols for c in ROUND_CURVE_COLS):
+        rc_lookup   = round_curve_lookup   or {}
+        rc_defaults = round_curve_defaults or {c: 0.0 for c in ROUND_CURVE_COLS}
+        norm_a = stats_a["name"].strip().lower()
+        norm_b = stats_b["name"].strip().lower()
+        rc_a = rc_lookup.get(norm_a, rc_defaults)
+        rc_b = rc_lookup.get(norm_b, rc_defaults)
+        for c in ROUND_CURVE_COLS:
+            row[f"{c}_delta"] = rc_a.get(c, rc_defaults.get(c, 0.0)) - \
+                                 rc_b.get(c, rc_defaults.get(c, 0.0))
+
+    # Chin / KO-power delta features
+    _ALL_CHIN_POWER = CHIN_COLS + POWER_COLS
+    if any(f"{c}_delta" in feature_cols for c in _ALL_CHIN_POWER):
+        norm_a = stats_a["name"].strip().lower()
+        norm_b = stats_b["name"].strip().lower()
+        _ch_def  = chin_defaults  or {c: 0.0 for c in CHIN_COLS}
+        _pw_def  = power_defaults or {c: 0.0 for c in POWER_COLS}
+        ch_a = (chin_lookup  or {}).get(norm_a, _ch_def)
+        ch_b = (chin_lookup  or {}).get(norm_b, _ch_def)
+        pw_a = (power_lookup or {}).get(norm_a, _pw_def)
+        pw_b = (power_lookup or {}).get(norm_b, _pw_def)
+        for c in CHIN_COLS:
+            row[f"{c}_delta"] = ch_a.get(c, _ch_def.get(c, 0.0)) - ch_b.get(c, _ch_def.get(c, 0.0))
+        for c in POWER_COLS:
+            row[f"{c}_delta"] = pw_a.get(c, _pw_def.get(c, 0.0)) - pw_b.get(c, _pw_def.get(c, 0.0))
+
     # Style one-hot columns
     for feat in feature_cols:
         if feat.startswith("a_style_"):
@@ -411,7 +476,16 @@ def build_feature_vector(
             style_b_suffix = _style_to_col_suffix(style_b)
             row[feat] = int(style_b_suffix == suffix)
 
-    return pd.DataFrame([row])[feature_cols]
+    # Build the row DataFrame and fill any features the current code didn't populate.
+    # This guards against model-code version skew: if the model was retrained with a
+    # new feature that this code version doesn't know how to compute (e.g. after
+    # /update without a bot restart), the feature gets 0.0 (population median) rather
+    # than crashing.  0.0 = no delta advantage for either fighter — a safe neutral value.
+    df_out = pd.DataFrame([row])
+    for col in feature_cols:
+        if col not in df_out.columns:
+            df_out[col] = 0.0
+    return df_out[feature_cols]
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +672,80 @@ def print_prediction(
 
 _cache: dict = {}
 
+_METHOD_LABELS = ["KO/TKO", "Submission", "Decision"]
+_ROUND_LABELS  = [1, 2, 3, 4]
+_ROUND_DISPLAY = {1: "Round 1", 2: "Round 2", 3: "Round 3", 4: "Round 4 or 5"}
+
+
+def predict_finish(X: pd.DataFrame, no_of_rounds: int = 3) -> dict:
+    """
+    Run method and round models to predict how the fight ends.
+    Returns dict with keys: method_probs, round_probs, predicted_method, predicted_round.
+
+    Note: no_of_rounds defaults to 3. Use 5 for known championship / co-main 5-round fights.
+    We don't detect this automatically at inference time; pass it explicitly when known.
+    """
+    result: dict = {
+        "predicted_method":  None,
+        "finish_method_probs": {},
+        "predicted_round":   None,
+        "finish_round_probs": {},
+    }
+
+    method_path = os.path.join(MODELS_DIR, "method_model.pkl")
+    round_path  = os.path.join(MODELS_DIR, "round_model.pkl")
+
+    # --- Method model ---
+    if "method_bundle" not in _cache:
+        if os.path.exists(method_path):
+            with open(method_path, "rb") as f:
+                _cache["method_bundle"] = pickle.load(f)
+        else:
+            _cache["method_bundle"] = None
+
+    method_bundle = _cache.get("method_bundle")
+    if method_bundle is not None:
+        m_model   = method_bundle["model"]
+        m_cols    = method_bundle["feature_cols"]
+        m_labels  = method_bundle["labels"]
+        X_m = X[m_cols]
+        proba_m = m_model.predict_proba(X_m)[0]   # shape (3,)
+        # XGBoost multi:softprob returns probs in class-index order: 0=KO/TKO, 1=Sub, 2=Decision
+        method_probs = {lbl: float(proba_m[i]) for i, lbl in enumerate(m_labels)}
+        predicted_method = max(method_probs, key=method_probs.get)
+        result["predicted_method"]  = predicted_method
+        result["finish_method_probs"] = method_probs
+    else:
+        return result
+
+    # --- Round model (only for non-Decision) ---
+    if "round_bundle" not in _cache:
+        if os.path.exists(round_path):
+            with open(round_path, "rb") as f:
+                _cache["round_bundle"] = pickle.load(f)
+        else:
+            _cache["round_bundle"] = None
+
+    if predicted_method != "Decision":
+        round_bundle = _cache.get("round_bundle")
+        if round_bundle is not None:
+            r_model  = round_bundle["model"]
+            r_cols   = round_bundle["feature_cols"]
+            r_labels = round_bundle["labels"]
+            X_r = X[r_cols[:-1]].copy()   # all except no_of_rounds
+            X_r["no_of_rounds"] = no_of_rounds
+            X_r = X_r[r_cols]             # reorder to match training column order
+            proba_r = r_model.predict_proba(X_r)[0]  # shape (4,)  0-indexed
+            round_probs = {lbl: float(proba_r[i]) for i, lbl in enumerate(r_labels)}
+            predicted_round_num = max(round_probs, key=round_probs.get)
+            result["predicted_round"]    = _ROUND_DISPLAY[predicted_round_num]
+            result["finish_round_probs"] = {
+                _ROUND_DISPLAY[lbl]: p for lbl, p in round_probs.items()
+            }
+
+    return result
+
+
 def _load_all(csv_path: str) -> tuple:
     if "bundle" not in _cache:
         model, feature_cols             = load_model_bundle()
@@ -611,7 +759,11 @@ def _load_all(csv_path: str) -> tuple:
         ratings_df = pd.read_csv(ratings_path) if os.path.exists(ratings_path) else pd.DataFrame()
         ew_path = os.path.join(DATA_DIR, "fighter_ew_stats.csv")
         ew_df = pd.read_csv(ew_path) if os.path.exists(ew_path) else pd.DataFrame()
-        _cache["bundle"] = (model, feature_cols, kmeans, scaler, labels, cluster_features, df, ratings_df, ew_df)
+        round_curve_lookup, round_curve_defaults = load_round_curve_profiles(min_fights=2)
+        chin_lookup, chin_defaults, power_lookup, power_defaults = load_chin_power_profiles(min_fights=3)
+        _cache["bundle"] = (model, feature_cols, kmeans, scaler, labels, cluster_features,
+                            df, ratings_df, ew_df, round_curve_lookup, round_curve_defaults,
+                            chin_lookup, chin_defaults, power_lookup, power_defaults)
     return _cache["bundle"]
 
 
@@ -628,7 +780,9 @@ def predict_matchup(
     if csv_path is None:
         csv_path = os.path.join(DATA_DIR, "raw", "ufc-master.csv")
 
-    model, feature_cols, kmeans, scaler, labels, cluster_features, df, ratings_df, ew_df = _load_all(csv_path)
+    (model, feature_cols, kmeans, scaler, labels, cluster_features,
+     df, ratings_df, ew_df, round_curve_lookup, round_curve_defaults,
+     chin_lookup, chin_defaults, power_lookup, power_defaults) = _load_all(csv_path)
 
     if verbose:
         print(f"\nLooking up fighters...")
@@ -643,11 +797,20 @@ def predict_matchup(
     # Historical style matchup win rate
     winrate = get_style_winrate(style_a, style_b)
 
-    # Build feature vector
-    X = build_feature_vector(stats_a, stats_b, style_a, style_b, winrate, feature_cols)
+    # Weight class (prefer A's, fall back to B's)
+    wc = stats_a.get("weight_class") or stats_b.get("weight_class") or ""
 
-    # Predict
+    # Build feature vector
+    X = build_feature_vector(stats_a, stats_b, style_a, style_b, winrate, feature_cols,
+                             round_curve_lookup, round_curve_defaults,
+                             chin_lookup, chin_defaults, power_lookup, power_defaults)
+
+    # Predict winner
     prob_a = float(model.predict_proba(X)[0, 1])
+
+    # Predict finish method and round
+    # no_of_rounds defaults to 3; championship fights use 5 (can be passed by caller)
+    finish_info = predict_finish(X, no_of_rounds=3)
 
     # SHAP explanation
     shap_vals = compute_shap(model, X)
@@ -671,20 +834,25 @@ def predict_matchup(
         )
 
     return {
-        "winner":     winner,
-        "confidence": conf,
-        "prob_a":     prob_a,
-        "name_a":     stats_a["name"],
-        "name_b":     stats_b["name"],
-        "style_a":    style_a,
-        "style_b":    style_b,
-        "glicko_a":   stats_a["glicko_rating"],
-        "glicko_b":   stats_b["glicko_rating"],
+        "winner":      winner,
+        "confidence":  conf,
+        "prob_a":      prob_a,
+        "name_a":      stats_a["name"],
+        "name_b":      stats_b["name"],
+        "style_a":     style_a,
+        "style_b":     style_b,
+        "weight_class": wc,
+        "glicko_a":    stats_a["glicko_rating"],
+        "glicko_b":    stats_b["glicko_rating"],
         "glicko_rd_a": stats_a["glicko_rd"],
         "glicko_rd_b": stats_b["glicko_rd"],
-        "top_for_a":  top_for_a,
-        "top_for_b":  top_for_b,
-        "summary":    summary,
+        "top_for_a":   top_for_a,
+        "top_for_b":   top_for_b,
+        "summary":     summary,
+        "finish_method":       finish_info.get("predicted_method"),
+        "finish_method_probs": finish_info.get("finish_method_probs", {}),
+        "finish_round":        finish_info.get("predicted_round"),
+        "finish_round_probs":  finish_info.get("finish_round_probs", {}),
     }
 
 
